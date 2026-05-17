@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Markdown Note</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex/dist/katex.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">Markdown Note</div>
+    <div id="folderStatus" class="folder-status">フォルダ未選択</div>
+    <div id="saveStatus" class="save-status idle">待機中</div>
+    <button id="toggleViewerButton" class="icon-button" type="button" title="閲覧モードに切り替え">
+      <i data-lucide="panel-right-open"></i>
+    </button>
+    <button id="loadButton" class="toolbar-button primary" type="button">
+      <i data-lucide="folder-open"></i>
+      <span>読み込み</span>
+    </button>
+  </header>
+
+  <main id="workspace" class="workspace">
+    <aside class="tree-panel panel" aria-label="階層ツリー">
+      <div class="panel-title">
+        <span>階層ツリー</span>
+        <div class="panel-actions">
+          <button id="newCategoryButton" class="icon-button small" type="button" title="カテゴリを作成">
+            <i data-lucide="folder-plus"></i>
+          </button>
+          <button id="newPageButton" class="icon-button small" type="button" title="ページを作成">
+            <i data-lucide="file-plus-2"></i>
+          </button>
+          <button id="renameButton" class="icon-button small" type="button" title="名前を変更">
+            <i data-lucide="pencil"></i>
+          </button>
+          <button id="deleteButton" class="icon-button small danger" type="button" title="削除">
+            <i data-lucide="trash-2"></i>
+          </button>
+        </div>
+      </div>
+      <nav id="treeList" class="tree-list"></nav>
+    </aside>
+
+    <div class="resizer" data-resizer="tree" aria-hidden="true"></div>
+
+    <aside class="toc-panel panel" aria-label="Markdown目次">
+      <div class="panel-title">目次</div>
+      <nav id="tocList" class="toc-list"></nav>
+    </aside>
+
+    <div class="resizer" data-resizer="toc" aria-hidden="true"></div>
+
+    <section id="editorPanel" class="editor-panel panel" aria-label="Markdown Editor">
+      <div class="panel-title">Markdown Editor</div>
+      <textarea id="editor" spellcheck="false" placeholder="ページを選択してください"></textarea>
+    </section>
+
+    <div id="editorResizer" class="resizer" data-resizer="editor" aria-hidden="true"></div>
+
+    <section class="preview-panel panel" aria-label="Markdown Viewer">
+      <div class="panel-title">Markdown Viewer</div>
+      <article id="preview" class="markdown-preview"></article>
+    </section>
+  </main>
+
+  <div id="dialogBackdrop" class="modal-backdrop" aria-hidden="true">
+    <form id="dialog" class="modal" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <h2 id="dialogTitle"></h2>
+        <button id="dialogCloseButton" class="icon-button" type="button" title="閉じる">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <p id="dialogMessage" class="dialog-message"></p>
+      <input id="dialogInput" class="dialog-input" type="text" autocomplete="off">
+      <div class="dialog-actions">
+        <button id="dialogCancelButton" class="toolbar-button" type="button">キャンセル</button>
+        <button id="dialogConfirmButton" class="toolbar-button primary" type="submit">OK</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/lucide@latest/dist/umd/lucide.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex/dist/katex.min.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
