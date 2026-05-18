@@ -35,6 +35,8 @@ let dialogResolver = null;
 let suppressEditorScroll = false;
 let suppressPreviewScroll = false;
 let viewerOnly = false;
+let headingHighlightTimer = null;
+let draggingTreePath = null;
 
 const expandedPaths = new Set([""]);
 const objectUrls = new Map();
@@ -238,6 +240,7 @@ function renderTree() {
       if (node) await selectNode(node);
     });
   });
+  bindTreeDragAndDrop();
 }
 
 function renderTreeNode(node, isRoot = false) {
@@ -255,7 +258,7 @@ function renderTreeNode(node, isRoot = false) {
 
   return `
     <div class="tree-node"${title}>
-      <div class="${rowClass}">
+      <div class="${rowClass}" data-tree-row data-path="${escapeAttr(node.path)}" ${isRoot ? "" : 'draggable="true"'}>
         <button class="tree-toggle" type="button" data-action="toggle" data-path="${escapeAttr(node.path)}" ${hasChildren ? "" : "tabindex='-1' aria-hidden='true'"}>
           ${toggleIcon ? `<i data-lucide="${toggleIcon}"></i>` : ""}
         </button>
@@ -267,6 +270,93 @@ function renderTreeNode(node, isRoot = false) {
       ${children}
     </div>
   `;
+}
+
+function bindTreeDragAndDrop() {
+  elements.treeList.querySelectorAll("[data-tree-row]").forEach((row) => {
+    row.addEventListener("dragstart", handleTreeDragStart);
+    row.addEventListener("dragover", handleTreeDragOver);
+    row.addEventListener("dragleave", handleTreeDragLeave);
+    row.addEventListener("drop", handleTreeDrop);
+    row.addEventListener("dragend", clearTreeDragState);
+  });
+}
+
+function handleTreeDragStart(event) {
+  const path = event.currentTarget.dataset.path;
+  const node = findNodeByPath(treeRoot, path);
+  if (!node || node === treeRoot) {
+    event.preventDefault();
+    return;
+  }
+
+  draggingTreePath = path;
+  event.currentTarget.classList.add("dragging");
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", path);
+}
+
+function handleTreeDragOver(event) {
+  if (!draggingTreePath) return;
+  const targetPath = event.currentTarget.dataset.path;
+  const source = findNodeByPath(treeRoot, draggingTreePath);
+  const target = findNodeByPath(treeRoot, targetPath);
+
+  if (canMoveNodeTo(source, target)) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    event.currentTarget.classList.add("drop-target");
+  } else {
+    event.currentTarget.classList.add("drop-denied");
+  }
+}
+
+function handleTreeDragLeave(event) {
+  event.currentTarget.classList.remove("drop-target", "drop-denied");
+}
+
+async function handleTreeDrop(event) {
+  event.preventDefault();
+  const targetPath = event.currentTarget.dataset.path;
+  clearTreeDragHighlights();
+
+  try {
+    await moveTreeNode(draggingTreePath, targetPath);
+  } catch (error) {
+    reportOperationError("移動できませんでした。", error);
+  } finally {
+    draggingTreePath = null;
+  }
+}
+
+function clearTreeDragState() {
+  draggingTreePath = null;
+  clearTreeDragHighlights();
+}
+
+function clearTreeDragHighlights() {
+  elements.treeList.querySelectorAll(".dragging, .drop-target, .drop-denied").forEach((row) => {
+    row.classList.remove("dragging", "drop-target", "drop-denied");
+  });
+}
+
+function canMoveNodeTo(source, target) {
+  if (!source || !target) return false;
+  if (source === treeRoot) return false;
+  if (target.type !== "category") return false;
+  if (source === target) return false;
+  if (source.parent === target) return false;
+  if (isDescendantNode(target, source)) return false;
+  return true;
+}
+
+function isDescendantNode(node, possibleAncestor) {
+  let current = node.parent;
+  while (current) {
+    if (current === possibleAncestor) return true;
+    current = current.parent;
+  }
+  return false;
 }
 
 function getTreeDisplayName(node) {
@@ -393,6 +483,34 @@ function expandAncestorPaths(path) {
     current = current ? `${current}/${part}` : part;
     expandedPaths.add(current);
   }
+}
+
+async function moveTreeNode(sourcePath, targetPath) {
+  if (!sourcePath && sourcePath !== "") return;
+  const source = findNodeByPath(treeRoot, sourcePath);
+  const target = findNodeByPath(treeRoot, targetPath);
+  if (!canMoveNodeTo(source, target)) {
+    throw new Error("移動先にはカテゴリフォルダを選択してください。");
+  }
+
+  await saveNow();
+  await ensureMissing(target.handle, source.name);
+  const targetHandle = await target.handle.getDirectoryHandle(source.name, { create: true });
+  await copyDirectory(source.handle, targetHandle);
+  await source.parent.handle.removeEntry(source.name, { recursive: true });
+
+  const newPath = target.path ? `${target.path}/${source.name}` : source.name;
+  expandedPaths.delete(source.path);
+  expandedPaths.add(target.path);
+  expandAncestorPaths(newPath);
+  if (source.type === "category") expandedPaths.add(newPath);
+
+  selectedNode = null;
+  selectedPageNode = null;
+  setEditorEnabled(false);
+  await scanAndRender(newPath);
+  const movedNode = findNodeByPath(treeRoot, newPath);
+  if (movedNode) await selectNode(movedNode);
 }
 
 async function renameSelected() {
@@ -583,8 +701,18 @@ function jumpToHeading(id) {
   const target = elements.preview.querySelector(`[data-heading-id="${cssEscape(id)}"]`);
   if (target) {
     target.scrollIntoView({ block: "start", behavior: "smooth" });
+    clearTimeout(headingHighlightTimer);
+    elements.preview.querySelectorAll(".heading-highlight").forEach((element) => {
+      element.classList.remove("heading-highlight");
+    });
     target.classList.remove("heading-highlight");
-    requestAnimationFrame(() => target.classList.add("heading-highlight"));
+    requestAnimationFrame(() => {
+      target.classList.add("heading-highlight");
+      headingHighlightTimer = setTimeout(() => {
+        target.classList.remove("heading-highlight");
+        headingHighlightTimer = null;
+      }, 1800);
+    });
   }
   const heading = headings.find((item) => item.id === id);
   if (heading) selectEditorLine(heading.lineIndex);
@@ -770,13 +898,14 @@ function isImageFile(file) {
 function setViewerOnly(enabled) {
   viewerOnly = enabled;
   elements.workspace.classList.toggle("viewer-only", enabled);
-  const icon = elements.toggleViewerButton.querySelector("i");
-  if (icon) {
-    icon.setAttribute("data-lucide", enabled ? "columns-3" : "panel-right-open");
-  }
-  elements.toggleViewerButton.title = enabled ? "編集モードに切り替え" : "閲覧モードに切り替え";
+  setToggleViewerButtonIcon(enabled ? "pencil" : "panel-right-open");
+  elements.toggleViewerButton.title = enabled ? "Editorを表示" : "閲覧モードに切り替え";
   elements.toggleViewerButton.setAttribute("aria-label", elements.toggleViewerButton.title);
   refreshIcons();
+}
+
+function setToggleViewerButtonIcon(iconName) {
+  elements.toggleViewerButton.innerHTML = `<i data-lucide="${iconName}"></i>`;
 }
 
 function syncPreviewFromEditor() {
@@ -905,7 +1034,7 @@ function stripMarkdown(text) {
   return text
     .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/[`*_>#~-]/g, "")
+    .replace(/[`*_>#~]/g, "")
     .trim();
 }
 

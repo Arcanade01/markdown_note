@@ -253,6 +253,22 @@ textarea {
   color: #1744a6;
 }
 
+.tree-row.dragging {
+  opacity: 0.55;
+}
+
+.tree-row.drop-target {
+  background: #dcfce7;
+  color: #166534;
+  outline: 1px solid #86efac;
+}
+
+.tree-row.drop-denied {
+  background: #fee2e2;
+  color: #991b1b;
+  outline: 1px solid #fecaca;
+}
+
 .tree-row.invalid {
   color: var(--warning);
 }
