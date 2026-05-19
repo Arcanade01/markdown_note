@@ -31,6 +31,7 @@ let saveState = "idle";
 let headings = [];
 let activeHeadingId = "";
 let renderSequence = 0;
+let previewSourceElements = [];
 let dialogResolver = null;
 let suppressEditorScroll = false;
 let suppressPreviewScroll = false;
@@ -40,7 +41,7 @@ let draggingTreePath = null;
 
 const expandedPaths = new Set([""]);
 const objectUrls = new Map();
-const DEFAULT_TREE_VISIBLE_LIMIT = 30;
+const EXPANDED_PATHS_STORAGE_PREFIX = "markdown-note-expanded-paths:";
 
 function initialize() {
   configureLibraries();
@@ -78,6 +79,7 @@ function bindEvents() {
 
   elements.editor.addEventListener("input", () => {
     renderPage(elements.editor.value);
+    syncPreviewToEditorLine(getEditorCursorLine(), 0.35);
     queueSave();
   });
   elements.editor.addEventListener("paste", handlePaste);
@@ -127,7 +129,8 @@ async function loadRootFolder() {
     selectedNode = null;
     selectedPageNode = null;
     clearObjectUrls();
-    await scanAndRender(null, { defaultExpand: true });
+    loadExpandedPaths();
+    await scanAndRender();
     elements.folderStatus.textContent = handle.name;
     setSaveStatus("saved", "読み込み済み");
   } catch (error) {
@@ -145,13 +148,10 @@ async function requestReadWritePermission(handle) {
   return (await handle.requestPermission(options)) === "granted";
 }
 
-async function scanAndRender(selectPath = null, options = {}) {
+async function scanAndRender(selectPath = null) {
   if (!rootHandle) return;
   treeRoot = await scanDirectory(rootHandle, "", null);
   sortTree(treeRoot);
-  if (options.defaultExpand) {
-    applyDefaultExpansion(treeRoot, DEFAULT_TREE_VISIBLE_LIMIT);
-  }
   if (selectPath) {
     const nextNode = findNodeByPath(treeRoot, selectPath);
     if (nextNode) selectedNode = nextNode;
@@ -230,6 +230,7 @@ function renderTree() {
       const path = button.dataset.path;
       if (expandedPaths.has(path)) expandedPaths.delete(path);
       else expandedPaths.add(path);
+      saveExpandedPaths();
       renderTree();
       refreshIcons();
     });
@@ -364,25 +365,6 @@ function getTreeDisplayName(node) {
   return `${node.name}${node.name.endsWith("/") ? "" : "/"}`;
 }
 
-function applyDefaultExpansion(root, visibleLimit) {
-  expandedPaths.clear();
-  let visibleCount = 1;
-  const queue = [root];
-
-  while (queue.length > 0) {
-    const node = queue.shift();
-    if (!node.children.length) continue;
-    if (visibleCount + node.children.length > visibleLimit) continue;
-
-    expandedPaths.add(node.path);
-    visibleCount += node.children.length;
-
-    for (const child of node.children) {
-      if (child.children.length > 0) queue.push(child);
-    }
-  }
-}
-
 async function selectNode(node) {
   await saveNow();
   selectedNode = node;
@@ -407,6 +389,7 @@ async function selectNode(node) {
   const indexHandle = await node.handle.getFileHandle("index.md");
   const file = await indexHandle.getFile();
   elements.editor.value = await file.text();
+  await deleteUnusedSrcFiles(node, elements.editor.value);
   renderPage(elements.editor.value);
   elements.folderStatus.textContent = `${rootHandle.name} / ${node.path}/index.md`;
   setSaveStatus("saved", "保存済み");
@@ -436,6 +419,7 @@ async function createCategory() {
     const path = parent.path ? `${parent.path}/${cleanName}` : cleanName;
     expandAncestorPaths(path);
     expandedPaths.add(path);
+    saveExpandedPaths();
     await scanAndRender(path);
     const node = findNodeByPath(treeRoot, path);
     if (node) await selectNode(node);
@@ -457,6 +441,7 @@ async function createPage() {
     await writeFile(indexHandle, `# ${name}\n`);
     const path = parent.path ? `${parent.path}/${name}` : name;
     expandAncestorPaths(path);
+    saveExpandedPaths();
     await scanAndRender(path);
     const node = findNodeByPath(treeRoot, path);
     if (node) await selectNode(node);
@@ -485,6 +470,45 @@ function expandAncestorPaths(path) {
   }
 }
 
+function getExpandedPathsStorageKey() {
+  return `${EXPANDED_PATHS_STORAGE_PREFIX}${rootHandle?.name || "default"}`;
+}
+
+function loadExpandedPaths() {
+  expandedPaths.clear();
+  try {
+    const raw = localStorage.getItem(getExpandedPathsStorageKey());
+    if (!raw) {
+      expandedPaths.add("");
+      return;
+    }
+    const paths = JSON.parse(raw);
+    if (Array.isArray(paths)) {
+      paths.forEach((path) => {
+        if (typeof path === "string") expandedPaths.add(path);
+      });
+    }
+  } catch {
+    expandedPaths.add("");
+  }
+}
+
+function saveExpandedPaths() {
+  try {
+    localStorage.setItem(getExpandedPathsStorageKey(), JSON.stringify([...expandedPaths]));
+  } catch (error) {
+    console.warn("展開状態を保存できませんでした。", error);
+  }
+}
+
+function removeExpandedPathBranch(path) {
+  for (const expandedPath of [...expandedPaths]) {
+    if (expandedPath === path || expandedPath.startsWith(`${path}/`)) {
+      expandedPaths.delete(expandedPath);
+    }
+  }
+}
+
 async function moveTreeNode(sourcePath, targetPath) {
   if (!sourcePath && sourcePath !== "") return;
   const source = findNodeByPath(treeRoot, sourcePath);
@@ -504,6 +528,7 @@ async function moveTreeNode(sourcePath, targetPath) {
   expandedPaths.add(target.path);
   expandAncestorPaths(newPath);
   if (source.type === "category") expandedPaths.add(newPath);
+  saveExpandedPaths();
 
   selectedNode = null;
   selectedPageNode = null;
@@ -521,11 +546,19 @@ async function renameSelected() {
     if (!nextName || nextName === selectedNode.name) return;
     const cleanName = sanitizeFolderName(nextName);
     const parent = selectedNode.parent;
+    const oldPath = selectedNode.path;
+    const wasExpanded = expandedPaths.has(oldPath);
     await ensureMissing(parent.handle, cleanName);
     const targetHandle = await parent.handle.getDirectoryHandle(cleanName, { create: true });
     await copyDirectory(selectedNode.handle, targetHandle);
     await parent.handle.removeEntry(selectedNode.name, { recursive: true });
     const path = parent.path ? `${parent.path}/${cleanName}` : cleanName;
+    if (wasExpanded) {
+      expandedPaths.delete(oldPath);
+      expandedPaths.add(path);
+    }
+    expandAncestorPaths(path);
+    saveExpandedPaths();
     await scanAndRender(path);
     const node = findNodeByPath(treeRoot, path);
     if (node) await selectNode(node);
@@ -542,10 +575,12 @@ async function deleteSelected() {
     if (confirmation !== selectedNode.name) return;
     await saveNow();
     const parent = selectedNode.parent;
+    removeExpandedPathBranch(selectedNode.path);
     await parent.handle.removeEntry(selectedNode.name, { recursive: true });
     selectedNode = parent;
     selectedPageNode = null;
     setEditorEnabled(false);
+    saveExpandedPaths();
     await scanAndRender(parent.path);
     await selectNode(parent);
   } catch (error) {
@@ -623,6 +658,7 @@ function renderPage(markdown) {
   headings = extractHeadings(markdown);
   activeHeadingId = headings[0]?.id || "";
   elements.preview.innerHTML = renderMarkdown(markdown);
+  annotatePreviewSourceLines(markdown);
   renderToc();
   resolveLocalLinks(sequence);
   renderAdvancedBlocks();
@@ -729,6 +765,160 @@ function selectEditorLine(lineIndex) {
   elements.editor.scrollTop = Math.max(0, lineIndex * lineHeight - elements.editor.clientHeight * 0.18);
 }
 
+function annotatePreviewSourceLines(markdown) {
+  const blocks = buildSourceBlocks(markdown);
+  const children = Array.from(elements.preview.children);
+  let cursor = 0;
+
+  previewSourceElements = [];
+
+  for (const block of blocks) {
+    const element = findNextPreviewBlock(children, cursor, block);
+    if (!element) continue;
+
+    cursor = children.indexOf(element) + 1;
+    setPreviewSourceLine(element, block.line);
+
+    if (block.type === "table") {
+      annotateTableRows(element, block);
+    }
+  }
+
+  previewSourceElements = Array.from(elements.preview.querySelectorAll("[data-source-line]"))
+    .sort((a, b) => Number(a.dataset.sourceLine) - Number(b.dataset.sourceLine));
+}
+
+function setPreviewSourceLine(element, line) {
+  element.dataset.sourceLine = String(line);
+  previewSourceElements.push(element);
+}
+
+function findNextPreviewBlock(children, startIndex, block) {
+  for (let index = startIndex; index < children.length; index += 1) {
+    if (matchesPreviewBlock(children[index], block)) return children[index];
+  }
+  return children[startIndex] || null;
+}
+
+function matchesPreviewBlock(element, block) {
+  const tag = element.tagName.toLowerCase();
+  if (block.type === "heading") return tag === `h${block.level}`;
+  if (block.type === "table") return tag === "table";
+  if (block.type === "list") return tag === block.tag;
+  if (block.type === "code") return tag === "pre" || element.classList.contains("diagram-block") || element.classList.contains("math-block");
+  if (block.type === "math") return element.classList.contains("math-block") || tag === "p";
+  return tag === block.tag;
+}
+
+function annotateTableRows(table, block) {
+  const rows = Array.from(table.querySelectorAll("tr"));
+  rows.forEach((row, index) => {
+    const line = index === 0 ? block.line : block.line + index + 1;
+    row.dataset.sourceLine = String(line);
+  });
+}
+
+function buildSourceBlocks(markdown) {
+  const lines = markdown.split(/\r?\n/);
+  const blocks = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+.+$/);
+    if (heading) {
+      blocks.push({ type: "heading", level: heading[1].length, line: index });
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*```/.test(line)) {
+      const start = index;
+      index += 1;
+      while (index < lines.length && !/^\s*```/.test(lines[index])) index += 1;
+      if (index < lines.length) index += 1;
+      blocks.push({ type: "code", line: start });
+      continue;
+    }
+
+    if (/^\s*\$\$\s*$/.test(line)) {
+      const start = index;
+      index += 1;
+      while (index < lines.length && !/^\s*\$\$\s*$/.test(lines[index])) index += 1;
+      if (index < lines.length) index += 1;
+      blocks.push({ type: "math", line: start });
+      continue;
+    }
+
+    if (isMarkdownTableStart(lines, index)) {
+      const start = index;
+      index += 2;
+      while (index < lines.length && /\|/.test(lines[index]) && lines[index].trim()) index += 1;
+      blocks.push({ type: "table", line: start });
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const start = index;
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) index += 1;
+      blocks.push({ type: "blockquote", tag: "blockquote", line: start });
+      continue;
+    }
+
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const start = index;
+      while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index])) index += 1;
+      blocks.push({ type: "list", tag: "ul", line: start });
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const start = index;
+      while (index < lines.length && /^\s*\d+\.\s+/.test(lines[index])) index += 1;
+      blocks.push({ type: "list", tag: "ol", line: start });
+      continue;
+    }
+
+    if (isMarkdownHorizontalRule(line)) {
+      blocks.push({ type: "hr", tag: "hr", line: index });
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !/^(#{1,6})\s+.+$/.test(lines[index]) &&
+      !/^\s*```/.test(lines[index]) &&
+      !/^\s*\$\$\s*$/.test(lines[index]) &&
+      !isMarkdownTableStart(lines, index) &&
+      !/^\s*>\s?/.test(lines[index]) &&
+      !/^\s*[-*+]\s+/.test(lines[index]) &&
+      !/^\s*\d+\.\s+/.test(lines[index]) &&
+      !isMarkdownHorizontalRule(lines[index])
+    ) {
+      index += 1;
+    }
+    blocks.push({ type: "paragraph", tag: "p", line: start });
+  }
+
+  return blocks;
+}
+
+function isMarkdownTableStart(lines, index) {
+  return index + 1 < lines.length && /\|/.test(lines[index]) && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[index + 1]);
+}
+
+function isMarkdownHorizontalRule(line) {
+  return /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line);
+}
+
 async function resolveLocalLinks(sequence) {
   if (!selectedPageNode) return;
   const images = Array.from(elements.preview.querySelectorAll("img[src]"));
@@ -750,6 +940,133 @@ async function resolveLocalLinks(sequence) {
       anchor.target = "_blank";
       anchor.rel = "noreferrer";
     }
+  }
+}
+
+async function deleteUnusedSrcFiles(pageNode, markdown) {
+  let srcHandle = null;
+  try {
+    srcHandle = await pageNode.handle.getDirectoryHandle("src");
+  } catch {
+    return;
+  }
+
+  const usedFiles = extractUsedSrcFileNames(markdown);
+
+  for await (const [name, handle] of srcHandle.entries()) {
+    if (handle.kind !== "file") continue;
+    if (usedFiles.has(name)) continue;
+    try {
+      await srcHandle.removeEntry(name);
+    } catch (error) {
+      console.warn(`未使用添付ファイルを削除できませんでした: ${name}`, error);
+    }
+  }
+}
+
+function extractUsedSrcFileNames(markdown) {
+  const used = new Set();
+
+  for (const reference of extractMarkdownLinkDestinations(markdown)) {
+    const fileName = getSrcFileNameFromReference(reference);
+    if (fileName) used.add(fileName);
+  }
+
+  const htmlAttributePattern = /<(?:img|a)\b[^>]*(?:src|href)=["']([^"']+)["'][^>]*>/gi;
+  let match = htmlAttributePattern.exec(markdown);
+  while (match) {
+    const fileName = getSrcFileNameFromReference(match[1]);
+    if (fileName) used.add(fileName);
+    match = htmlAttributePattern.exec(markdown);
+  }
+
+  return used;
+}
+
+function extractMarkdownLinkDestinations(markdown) {
+  const destinations = [];
+  let searchIndex = 0;
+
+  while (searchIndex < markdown.length) {
+    const openIndex = markdown.indexOf("](", searchIndex);
+    if (openIndex === -1) break;
+
+    let index = openIndex + 2;
+    let destination = "";
+
+    if (markdown[index] === "<") {
+      index += 1;
+      while (index < markdown.length && markdown[index] !== ">") {
+        destination += markdown[index];
+        index += 1;
+      }
+    } else {
+      let depth = 0;
+      let escaped = false;
+
+      while (index < markdown.length) {
+        const char = markdown[index];
+
+        if (escaped) {
+          destination += char;
+          escaped = false;
+          index += 1;
+          continue;
+        }
+
+        if (char === "\\") {
+          escaped = true;
+          index += 1;
+          continue;
+        }
+
+        if (char === "(") {
+          depth += 1;
+          destination += char;
+          index += 1;
+          continue;
+        }
+
+        if (char === ")") {
+          if (depth === 0) break;
+          depth -= 1;
+          destination += char;
+          index += 1;
+          continue;
+        }
+
+        if (/\s/.test(char) && depth === 0) break;
+
+        destination += char;
+        index += 1;
+      }
+    }
+
+    if (destination.trim()) destinations.push(destination.trim());
+    searchIndex = openIndex + 2;
+  }
+
+  return destinations;
+}
+
+function getSrcFileNameFromReference(reference) {
+  const clean = decodeMarkdownUrl(reference)
+    .split("#")[0]
+    .split("?")[0]
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "");
+
+  if (!clean.startsWith("src/")) return "";
+  const rest = clean.slice("src/".length);
+  if (!rest || rest.includes("/")) return "";
+  return rest;
+}
+
+function decodeMarkdownUrl(value) {
+  try {
+    return decodeURIComponent(value.trim());
+  } catch {
+    return value.trim();
   }
 }
 
@@ -788,26 +1105,28 @@ async function handlePaste(event) {
   const files = getClipboardImageFiles(event);
   if (!files.length) return;
   event.preventDefault();
-  await insertFiles(files, true);
+  await insertFiles(files, { imageOnly: true, useUuidName: true });
 }
 
 async function handleDrop(event) {
   event.preventDefault();
   const files = Array.from(event.dataTransfer?.files || []);
   if (!files.length) return;
-  await insertFiles(files, false);
+  await insertFiles(files, { imageOnly: false, useUuidName: false });
 }
 
-async function insertFiles(files, imageOnly) {
+async function insertFiles(files, options = {}) {
   if (!selectedPageNode) {
     alert("先にページフォルダを選択してください。");
     return;
   }
+  const { imageOnly = false, useUuidName = false } = options;
   const srcHandle = await selectedPageNode.handle.getDirectoryHandle("src", { create: true });
   const inserted = [];
   for (const file of files) {
     if (imageOnly && !isImageFile(file)) continue;
-    const safeName = await uniqueFileName(srcHandle, file.name || defaultFileName(file));
+    const fileName = useUuidName ? uuidFileName(file) : (file.name || defaultFileName(file));
+    const safeName = await uniqueFileName(srcHandle, fileName);
     const handle = await srcHandle.getFileHandle(safeName, { create: true });
     await writeFile(handle, file);
     const isImage = isImageFile(file);
@@ -873,6 +1192,16 @@ function defaultFileName(file) {
   return `file-${new Date().toISOString().replace(/[-:T.Z]/g, "").slice(0, 14)}${ext}`;
 }
 
+function uuidFileName(file) {
+  const extension = extensionFromMime(file.type) || extensionFromFileName(file.name) || ".png";
+  return `${crypto.randomUUID()}${extension}`;
+}
+
+function extensionFromFileName(name = "") {
+  const match = name.match(/(\.[A-Za-z0-9]+)$/);
+  return match ? match[1].toLowerCase() : "";
+}
+
 function reportOperationError(message, error) {
   console.error(error);
   setSaveStatus("error", "操作失敗");
@@ -910,22 +1239,75 @@ function setToggleViewerButtonIcon(iconName) {
 
 function syncPreviewFromEditor() {
   if (suppressEditorScroll || !selectedPageNode) return;
+  syncPreviewToEditorLine(getEditorTopLine(), 0);
+}
+
+function syncEditorFromPreview() {
+  if (suppressPreviewScroll || !selectedPageNode || elements.editor.disabled) return;
+  const line = getPreviewTopSourceLine();
+  if (line === null) return;
+  syncEditorToLine(line, 0);
+}
+
+function syncPreviewToEditorLine(lineIndex, viewportRatio) {
+  const target = findPreviewElementForLine(lineIndex);
+  if (!target) return;
+
   suppressPreviewScroll = true;
-  const ratio = elements.editor.scrollTop / Math.max(1, elements.editor.scrollHeight - elements.editor.clientHeight);
-  elements.preview.scrollTop = ratio * Math.max(1, elements.preview.scrollHeight - elements.preview.clientHeight);
+  const nextTop = target.offsetTop - elements.preview.clientHeight * viewportRatio;
+  elements.preview.scrollTop = Math.max(0, nextTop);
   setTimeout(() => {
     suppressPreviewScroll = false;
   }, 80);
 }
 
-function syncEditorFromPreview() {
-  if (suppressPreviewScroll || !selectedPageNode || elements.editor.disabled) return;
+function syncEditorToLine(lineIndex, viewportRatio) {
   suppressEditorScroll = true;
-  const ratio = elements.preview.scrollTop / Math.max(1, elements.preview.scrollHeight - elements.preview.clientHeight);
-  elements.editor.scrollTop = ratio * Math.max(1, elements.editor.scrollHeight - elements.editor.clientHeight);
+  elements.editor.scrollTop = Math.max(0, lineIndex * getEditorLineHeight() - elements.editor.clientHeight * viewportRatio);
   setTimeout(() => {
     suppressEditorScroll = false;
   }, 80);
+}
+
+function findPreviewElementForLine(lineIndex) {
+  if (!previewSourceElements.length) return null;
+  let best = previewSourceElements[0];
+
+  for (const element of previewSourceElements) {
+    const sourceLine = Number(element.dataset.sourceLine);
+    if (!Number.isFinite(sourceLine)) continue;
+    if (sourceLine > lineIndex) break;
+    best = element;
+  }
+
+  return best;
+}
+
+function getPreviewTopSourceLine() {
+  if (!previewSourceElements.length) return null;
+  const top = elements.preview.scrollTop + 1;
+  let fallback = previewSourceElements[0];
+
+  for (const element of previewSourceElements) {
+    const line = Number(element.dataset.sourceLine);
+    if (!Number.isFinite(line)) continue;
+    if (element.offsetTop + element.offsetHeight >= top) return line;
+    fallback = element;
+  }
+
+  return Number(fallback.dataset.sourceLine);
+}
+
+function getEditorCursorLine() {
+  return elements.editor.value.slice(0, elements.editor.selectionStart).split(/\r?\n/).length - 1;
+}
+
+function getEditorTopLine() {
+  return Math.max(0, Math.floor(elements.editor.scrollTop / getEditorLineHeight()));
+}
+
+function getEditorLineHeight() {
+  return parseFloat(getComputedStyle(elements.editor).lineHeight) || 24;
 }
 
 function startResize(event) {
@@ -1034,7 +1416,7 @@ function stripMarkdown(text) {
   return text
     .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/[`*_>#~]/g, "")
+    .replace(/[`*>#~]/g, "")
     .trim();
 }
 
