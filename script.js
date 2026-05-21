@@ -1254,7 +1254,7 @@ function syncPreviewToEditorLine(lineIndex, viewportRatio) {
   if (!target) return;
 
   suppressPreviewScroll = true;
-  const nextTop = target.offsetTop - elements.preview.clientHeight * viewportRatio;
+  const nextTop = getElementTopInScrollContainer(target, elements.preview) - elements.preview.clientHeight * viewportRatio;
   elements.preview.scrollTop = Math.max(0, nextTop);
   setTimeout(() => {
     suppressPreviewScroll = false;
@@ -1291,11 +1291,19 @@ function getPreviewTopSourceLine() {
   for (const element of previewSourceElements) {
     const line = Number(element.dataset.sourceLine);
     if (!Number.isFinite(line)) continue;
-    if (element.offsetTop + element.offsetHeight >= top) return line;
+    const elementTop = getElementTopInScrollContainer(element, elements.preview);
+    const elementHeight = element.getBoundingClientRect().height || element.offsetHeight;
+    if (elementTop + elementHeight >= top) return line;
     fallback = element;
   }
 
   return Number(fallback.dataset.sourceLine);
+}
+
+function getElementTopInScrollContainer(element, container) {
+  const elementRect = element.getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  return elementRect.top - containerRect.top + container.scrollTop;
 }
 
 function getEditorCursorLine() {
