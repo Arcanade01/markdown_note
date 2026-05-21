@@ -38,6 +38,7 @@ let suppressPreviewScroll = false;
 let viewerOnly = false;
 let headingHighlightTimer = null;
 let draggingTreePath = null;
+let editorLineMetricsCache = null;
 
 const expandedPaths = new Set([""]);
 const objectUrls = new Map();
@@ -78,6 +79,7 @@ function bindEvents() {
   elements.deleteButton.addEventListener("click", deleteSelected);
 
   elements.editor.addEventListener("input", () => {
+    invalidateEditorLineMetrics();
     renderPage(elements.editor.value);
     syncPreviewToEditorLine(getEditorCursorLine(), 0.35);
     queueSave();
@@ -389,6 +391,7 @@ async function selectNode(node) {
   const indexHandle = await node.handle.getFileHandle("index.md");
   const file = await indexHandle.getFile();
   elements.editor.value = await file.text();
+  invalidateEditorLineMetrics();
   await deleteUnusedSrcFiles(node, elements.editor.value);
   renderPage(elements.editor.value);
   elements.folderStatus.textContent = `${rootHandle.name} / ${node.path}/index.md`;
@@ -658,53 +661,224 @@ function renderPage(markdown) {
   headings = extractHeadings(markdown);
   activeHeadingId = headings[0]?.id || "";
   elements.preview.innerHTML = renderMarkdown(markdown);
-  annotatePreviewSourceLines(markdown);
+  collectPreviewSourceElements();
   renderToc();
   resolveLocalLinks(sequence);
   renderAdvancedBlocks();
 }
 
 function renderMarkdown(markdown) {
+  const lines = markdown.split(/\r?\n/);
+  const headingByLine = new Map(headings.map((heading) => [heading.lineIndex, heading]));
+  const html = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const heading = headingByLine.get(index);
+      const id = heading?.id || slugify(stripMarkdown(headingMatch[2])) || `heading-${index + 1}`;
+      html.push(`<h${level} id="${escapeAttr(id)}" data-heading-id="${escapeAttr(id)}" data-source-line="${index}">${renderInlineMarkdown(headingMatch[2])}</h${level}>`);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*```/.test(line)) {
+      const start = index;
+      const language = line.replace(/^\s*```/, "").trim().toLowerCase();
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```/.test(lines[index])) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      const codeText = code.join("\n");
+      if (language === "mermaid") {
+        html.push(`<div class="diagram-block mermaid" data-source-line="${start}">${escapeHtml(codeText)}</div>`);
+      } else {
+        html.push(`<pre data-source-line="${start}"><code class="language-${escapeAttr(language)}">${escapeHtml(codeText)}</code></pre>`);
+      }
+      continue;
+    }
+
+    if (/^\s*\$\$\s*$/.test(line)) {
+      const start = index;
+      const latex = [];
+      index += 1;
+      while (index < lines.length && !/^\s*\$\$\s*$/.test(lines[index])) {
+        latex.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      html.push(renderMathBlock(latex.join("\n"), start));
+      continue;
+    }
+
+    if (isMarkdownTableStart(lines, index)) {
+      const start = index;
+      const tableLines = [lines[index], lines[index + 1]];
+      index += 2;
+      while (index < lines.length && /\|/.test(lines[index]) && lines[index].trim()) {
+        tableLines.push(lines[index]);
+        index += 1;
+      }
+      html.push(renderSourceMappedTable(tableLines, start));
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const start = index;
+      const quoteLines = [];
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+        quoteLines.push({ line: index, text: lines[index].replace(/^\s*>\s?/, "") });
+        index += 1;
+      }
+      html.push(`<blockquote data-source-line="${start}">${quoteLines.map((item) => `<p data-source-line="${item.line}">${renderInlineMarkdown(item.text)}</p>`).join("")}</blockquote>`);
+      continue;
+    }
+
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const start = index;
+      const items = [];
+      while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index])) {
+        items.push({ line: index, text: lines[index].replace(/^\s*[-*+]\s+/, "") });
+        index += 1;
+      }
+      html.push(renderSourceMappedList("ul", items, start));
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const start = index;
+      const items = [];
+      while (index < lines.length && /^\s*\d+\.\s+/.test(lines[index])) {
+        items.push({ line: index, text: lines[index].replace(/^\s*\d+\.\s+/, "") });
+        index += 1;
+      }
+      html.push(renderSourceMappedList("ol", items, start));
+      continue;
+    }
+
+    if (isMarkdownHorizontalRule(line)) {
+      html.push(`<hr data-source-line="${index}">`);
+      index += 1;
+      continue;
+    }
+
+    const start = index;
+    const paragraph = [];
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !/^(#{1,6})\s+.+$/.test(lines[index]) &&
+      !/^\s*```/.test(lines[index]) &&
+      !/^\s*\$\$\s*$/.test(lines[index]) &&
+      !isMarkdownTableStart(lines, index) &&
+      !/^\s*>\s?/.test(lines[index]) &&
+      !/^\s*[-*+]\s+/.test(lines[index]) &&
+      !/^\s*\d+\.\s+/.test(lines[index]) &&
+      !isMarkdownHorizontalRule(lines[index])
+    ) {
+      paragraph.push({ line: index, text: lines[index] });
+      index += 1;
+    }
+    html.push(`<p data-source-line="${start}">${paragraph.map((item, itemIndex) => {
+      const separator = itemIndex < paragraph.length - 1 ? "\n" : "";
+      return `<span data-source-line="${item.line}">${renderInlineMarkdown(item.text)}</span>${separator}`;
+    }).join("")}</p>`);
+  }
+
+  return html.join("\n");
+}
+
+function collectPreviewSourceElements() {
+  previewSourceElements = Array.from(elements.preview.querySelectorAll("[data-source-line]"))
+    .sort((a, b) => {
+      const lineDiff = Number(a.dataset.sourceLine) - Number(b.dataset.sourceLine);
+      if (lineDiff !== 0) return lineDiff;
+      if (a === b) return 0;
+      return a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+    });
+}
+
+function renderInlineMarkdown(text) {
   const mathTokens = [];
-  const withBlockMath = markdown.replace(/\$\$([\s\S]+?)\$\$/g, (_, latex) => {
-    const token = `@@MATH_BLOCK_${mathTokens.length}@@`;
-    mathTokens.push({ type: "block", latex: latex.trim() });
-    return token;
-  });
-  const withInlineMath = withBlockMath.replace(/(^|[^\\])\$([^$\n]+?)\$/g, (match, prefix, latex) => {
-    const token = `@@MATH_INLINE_${mathTokens.length}@@`;
-    mathTokens.push({ type: "inline", latex: latex.trim() });
+  const tokenized = text.replace(/(^|[^\\])\$([^$\n]+?)\$/g, (match, prefix, latex) => {
+    const token = `@@INLINE_MATH_${mathTokens.length}@@`;
+    mathTokens.push(latex.trim());
     return `${prefix}${token}`;
   });
-
-  const renderer = new marked.Renderer();
-  renderer.heading = ({ tokens, depth }) => {
-    const text = marked.Parser.parseInline(tokens);
-    const plain = stripHtml(text);
-    const heading = headings.find((item) => item.text === plain && !item.rendered);
-    if (heading) heading.rendered = true;
-    const id = heading?.id || slugify(plain);
-    return `<h${depth} id="${escapeAttr(id)}" data-heading-id="${escapeAttr(id)}">${text}</h${depth}>`;
-  };
-  renderer.code = ({ text, lang }) => {
-    if ((lang || "").toLowerCase() === "mermaid") {
-      return `<div class="diagram-block mermaid">${escapeHtml(text)}</div>`;
-    }
-    return `<pre><code class="language-${escapeAttr(lang || "")}">${escapeHtml(text)}</code></pre>`;
-  };
-
-  let html = marked.parse(withInlineMath, { renderer });
-  html = html.replace(/@@MATH_(BLOCK|INLINE)_(\d+)@@/g, (_, type, index) => {
-    const item = mathTokens[Number(index)];
-    if (!item) return "";
-    try {
-      const rendered = katex.renderToString(item.latex, { throwOnError: false, displayMode: item.type === "block" });
-      return item.type === "block" ? `<div class="math-block">${rendered}</div>` : `<span class="math-inline">${rendered}</span>`;
-    } catch {
-      return escapeHtml(item.latex);
-    }
-  });
+  let html = marked.parseInline(tokenized);
+  html = html.replace(/@@INLINE_MATH_(\d+)@@/g, (_, index) => renderMathInline(mathTokens[Number(index)] || ""));
   return html;
+}
+
+function renderMathInline(latex) {
+  try {
+    return katex.renderToString(latex, { throwOnError: false, displayMode: false });
+  } catch {
+    return escapeHtml(latex);
+  }
+}
+
+function renderMathBlock(latex, line) {
+  try {
+    return `<div class="math-block" data-source-line="${line}">${katex.renderToString(latex, { throwOnError: false, displayMode: true })}</div>`;
+  } catch {
+    return `<div class="math-block" data-source-line="${line}">${escapeHtml(latex)}</div>`;
+  }
+}
+
+function renderSourceMappedList(tag, items, startLine) {
+  const listItems = items.map((item) => {
+    const task = item.text.match(/^\[(x|X| )]\s+(.*)$/);
+    if (!task) return `<li data-source-line="${item.line}">${renderInlineMarkdown(item.text)}</li>`;
+    const checked = task[1].toLowerCase() === "x" ? " checked" : "";
+    return `<li class="task-list-item" data-source-line="${item.line}"><input type="checkbox" disabled${checked}> ${renderInlineMarkdown(task[2])}</li>`;
+  }).join("");
+  return `<${tag} data-source-line="${startLine}">${listItems}</${tag}>`;
+}
+
+function renderSourceMappedTable(tableLines, startLine) {
+  const headers = splitMarkdownTableRow(tableLines[0]);
+  const alignments = splitMarkdownTableRow(tableLines[1]).map(getMarkdownTableAlignment);
+  const headerCells = headers.map((header, index) => `<th${tableAlignAttribute(alignments[index])}>${renderInlineMarkdown(header)}</th>`).join("");
+  const bodyRows = tableLines.slice(2).map((line, rowIndex) => {
+    const lineNumber = startLine + rowIndex + 2;
+    const cells = splitMarkdownTableRow(line);
+    const rowCells = headers.map((_, cellIndex) => `<td${tableAlignAttribute(alignments[cellIndex])}>${renderInlineMarkdown(cells[cellIndex] || "")}</td>`).join("");
+    return `<tr data-source-line="${lineNumber}">${rowCells}</tr>`;
+  }).join("");
+  return `<table data-source-line="${startLine}"><thead><tr data-source-line="${startLine}">${headerCells}</tr></thead><tbody>${bodyRows}</tbody></table>`;
+}
+
+function splitMarkdownTableRow(row) {
+  return row
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function getMarkdownTableAlignment(separator) {
+  if (/^:-+:$/.test(separator)) return "center";
+  if (/^-+:$/.test(separator)) return "right";
+  if (/^:-+$/.test(separator)) return "left";
+  return "";
+}
+
+function tableAlignAttribute(alignment) {
+  return alignment ? ` style="text-align: ${alignment}"` : "";
 }
 
 async function renderAdvancedBlocks() {
@@ -759,156 +933,9 @@ function selectEditorLine(lineIndex) {
   const lines = elements.editor.value.split(/\r?\n/);
   const start = lines.slice(0, lineIndex).join("\n").length + (lineIndex > 0 ? 1 : 0);
   const end = start + lines[lineIndex].length;
-  const lineHeight = parseFloat(getComputedStyle(elements.editor).lineHeight) || 24;
   elements.editor.focus({ preventScroll: true });
   elements.editor.setSelectionRange(start, end);
-  elements.editor.scrollTop = Math.max(0, lineIndex * lineHeight - elements.editor.clientHeight * 0.18);
-}
-
-function annotatePreviewSourceLines(markdown) {
-  const blocks = buildSourceBlocks(markdown);
-  const children = Array.from(elements.preview.children);
-  let cursor = 0;
-
-  previewSourceElements = [];
-
-  for (const block of blocks) {
-    const element = findNextPreviewBlock(children, cursor, block);
-    if (!element) continue;
-
-    cursor = children.indexOf(element) + 1;
-    setPreviewSourceLine(element, block.line);
-
-    if (block.type === "table") {
-      annotateTableRows(element, block);
-    }
-  }
-
-  previewSourceElements = Array.from(elements.preview.querySelectorAll("[data-source-line]"))
-    .sort((a, b) => Number(a.dataset.sourceLine) - Number(b.dataset.sourceLine));
-}
-
-function setPreviewSourceLine(element, line) {
-  element.dataset.sourceLine = String(line);
-  previewSourceElements.push(element);
-}
-
-function findNextPreviewBlock(children, startIndex, block) {
-  for (let index = startIndex; index < children.length; index += 1) {
-    if (matchesPreviewBlock(children[index], block)) return children[index];
-  }
-  return children[startIndex] || null;
-}
-
-function matchesPreviewBlock(element, block) {
-  const tag = element.tagName.toLowerCase();
-  if (block.type === "heading") return tag === `h${block.level}`;
-  if (block.type === "table") return tag === "table";
-  if (block.type === "list") return tag === block.tag;
-  if (block.type === "code") return tag === "pre" || element.classList.contains("diagram-block") || element.classList.contains("math-block");
-  if (block.type === "math") return element.classList.contains("math-block") || tag === "p";
-  return tag === block.tag;
-}
-
-function annotateTableRows(table, block) {
-  const rows = Array.from(table.querySelectorAll("tr"));
-  rows.forEach((row, index) => {
-    const line = index === 0 ? block.line : block.line + index + 1;
-    row.dataset.sourceLine = String(line);
-  });
-}
-
-function buildSourceBlocks(markdown) {
-  const lines = markdown.split(/\r?\n/);
-  const blocks = [];
-  let index = 0;
-
-  while (index < lines.length) {
-    const line = lines[index];
-    if (!line.trim()) {
-      index += 1;
-      continue;
-    }
-
-    const heading = line.match(/^(#{1,6})\s+.+$/);
-    if (heading) {
-      blocks.push({ type: "heading", level: heading[1].length, line: index });
-      index += 1;
-      continue;
-    }
-
-    if (/^\s*```/.test(line)) {
-      const start = index;
-      index += 1;
-      while (index < lines.length && !/^\s*```/.test(lines[index])) index += 1;
-      if (index < lines.length) index += 1;
-      blocks.push({ type: "code", line: start });
-      continue;
-    }
-
-    if (/^\s*\$\$\s*$/.test(line)) {
-      const start = index;
-      index += 1;
-      while (index < lines.length && !/^\s*\$\$\s*$/.test(lines[index])) index += 1;
-      if (index < lines.length) index += 1;
-      blocks.push({ type: "math", line: start });
-      continue;
-    }
-
-    if (isMarkdownTableStart(lines, index)) {
-      const start = index;
-      index += 2;
-      while (index < lines.length && /\|/.test(lines[index]) && lines[index].trim()) index += 1;
-      blocks.push({ type: "table", line: start });
-      continue;
-    }
-
-    if (/^\s*>\s?/.test(line)) {
-      const start = index;
-      while (index < lines.length && /^\s*>\s?/.test(lines[index])) index += 1;
-      blocks.push({ type: "blockquote", tag: "blockquote", line: start });
-      continue;
-    }
-
-    if (/^\s*[-*+]\s+/.test(line)) {
-      const start = index;
-      while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index])) index += 1;
-      blocks.push({ type: "list", tag: "ul", line: start });
-      continue;
-    }
-
-    if (/^\s*\d+\.\s+/.test(line)) {
-      const start = index;
-      while (index < lines.length && /^\s*\d+\.\s+/.test(lines[index])) index += 1;
-      blocks.push({ type: "list", tag: "ol", line: start });
-      continue;
-    }
-
-    if (isMarkdownHorizontalRule(line)) {
-      blocks.push({ type: "hr", tag: "hr", line: index });
-      index += 1;
-      continue;
-    }
-
-    const start = index;
-    while (
-      index < lines.length &&
-      lines[index].trim() &&
-      !/^(#{1,6})\s+.+$/.test(lines[index]) &&
-      !/^\s*```/.test(lines[index]) &&
-      !/^\s*\$\$\s*$/.test(lines[index]) &&
-      !isMarkdownTableStart(lines, index) &&
-      !/^\s*>\s?/.test(lines[index]) &&
-      !/^\s*[-*+]\s+/.test(lines[index]) &&
-      !/^\s*\d+\.\s+/.test(lines[index]) &&
-      !isMarkdownHorizontalRule(lines[index])
-    ) {
-      index += 1;
-    }
-    blocks.push({ type: "paragraph", tag: "p", line: start });
-  }
-
-  return blocks;
+  elements.editor.scrollTop = Math.max(0, getEditorLineTop(lineIndex) - elements.editor.clientHeight * 0.18);
 }
 
 function isMarkdownTableStart(lines, index) {
@@ -1239,22 +1266,29 @@ function setToggleViewerButtonIcon(iconName) {
 
 function syncPreviewFromEditor() {
   if (suppressEditorScroll || !selectedPageNode) return;
-  syncPreviewToEditorLine(getEditorTopLine(), 0);
+  syncPreviewToEditorLinePosition(getEditorTopLinePosition(), 0);
 }
 
 function syncEditorFromPreview() {
   if (suppressPreviewScroll || !selectedPageNode || elements.editor.disabled) return;
-  const line = getPreviewTopSourceLine();
-  if (line === null) return;
-  syncEditorToLine(line, 0);
+  const position = getPreviewTopSourcePosition();
+  if (!position) return;
+  syncEditorToLinePosition(position, 0);
 }
 
 function syncPreviewToEditorLine(lineIndex, viewportRatio) {
+  syncPreviewToEditorLinePosition({ line: lineIndex, progress: 0 }, viewportRatio);
+}
+
+function syncPreviewToEditorLinePosition(position, viewportRatio) {
+  const lineIndex = position?.line ?? 0;
   const target = findPreviewElementForLine(lineIndex);
   if (!target) return;
 
   suppressPreviewScroll = true;
-  const nextTop = getElementTopInScrollContainer(target, elements.preview) - elements.preview.clientHeight * viewportRatio;
+  const progress = clamp(position?.progress ?? 0, 0, 1);
+  const targetHeight = target.getBoundingClientRect().height || target.offsetHeight || 1;
+  const nextTop = getElementTopInScrollContainer(target, elements.preview) + targetHeight * progress - elements.preview.clientHeight * viewportRatio;
   elements.preview.scrollTop = Math.max(0, nextTop);
   setTimeout(() => {
     suppressPreviewScroll = false;
@@ -1262,8 +1296,18 @@ function syncPreviewToEditorLine(lineIndex, viewportRatio) {
 }
 
 function syncEditorToLine(lineIndex, viewportRatio) {
+  syncEditorToLinePosition({ line: lineIndex, progress: 0 }, viewportRatio);
+}
+
+function syncEditorToLinePosition(position, viewportRatio) {
+  const metrics = getEditorLineMetrics();
+  const safeIndex = Math.min(Math.max(0, position?.line ?? 0), metrics.tops.length - 1);
+  const lineTop = metrics.tops[safeIndex] || 0;
+  const lineBottom = metrics.bottoms[safeIndex] || lineTop + getEditorLineHeight();
+  const progress = clamp(position?.progress ?? 0, 0, 1);
+
   suppressEditorScroll = true;
-  elements.editor.scrollTop = Math.max(0, lineIndex * getEditorLineHeight() - elements.editor.clientHeight * viewportRatio);
+  elements.editor.scrollTop = Math.max(0, lineTop + (lineBottom - lineTop) * progress - elements.editor.clientHeight * viewportRatio);
   setTimeout(() => {
     suppressEditorScroll = false;
   }, 80);
@@ -1284,20 +1328,41 @@ function findPreviewElementForLine(lineIndex) {
 }
 
 function getPreviewTopSourceLine() {
+  return getPreviewTopSourcePosition()?.line ?? null;
+}
+
+function getPreviewTopSourcePosition() {
   if (!previewSourceElements.length) return null;
   const top = elements.preview.scrollTop + 1;
-  let fallback = previewSourceElements[0];
+  let best = null;
+  let fallback = null;
+  let fallbackTop = -Infinity;
 
   for (const element of previewSourceElements) {
     const line = Number(element.dataset.sourceLine);
     if (!Number.isFinite(line)) continue;
     const elementTop = getElementTopInScrollContainer(element, elements.preview);
-    const elementHeight = element.getBoundingClientRect().height || element.offsetHeight;
-    if (elementTop + elementHeight >= top) return line;
-    fallback = element;
+    const elementHeight = element.getBoundingClientRect().height || element.offsetHeight || 1;
+    const elementBottom = elementTop + elementHeight;
+
+    if (elementTop <= top && elementBottom >= top) {
+      const candidate = {
+        line,
+        progress: clamp((top - elementTop) / elementHeight, 0, 1),
+        height: elementHeight
+      };
+      if (!best || candidate.height < best.height || (candidate.height === best.height && candidate.line > best.line)) {
+        best = candidate;
+      }
+    }
+
+    if (elementTop <= top && elementTop >= fallbackTop) {
+      fallbackTop = elementTop;
+      fallback = { line, progress: 1 };
+    }
   }
 
-  return Number(fallback.dataset.sourceLine);
+  return best || fallback || { line: Number(previewSourceElements[0].dataset.sourceLine) || 0, progress: 0 };
 }
 
 function getElementTopInScrollContainer(element, container) {
@@ -1311,11 +1376,101 @@ function getEditorCursorLine() {
 }
 
 function getEditorTopLine() {
-  return Math.max(0, Math.floor(elements.editor.scrollTop / getEditorLineHeight()));
+  return getEditorTopLinePosition().line;
+}
+
+function getEditorTopLinePosition() {
+  const metrics = getEditorLineMetrics();
+  const scrollTop = elements.editor.scrollTop;
+  let low = 0;
+  let high = metrics.tops.length - 1;
+  let result = 0;
+
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (metrics.tops[middle] <= scrollTop + 1) {
+      result = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  const lineTop = metrics.tops[result] || 0;
+  const lineBottom = metrics.bottoms[result] || lineTop + getEditorLineHeight();
+  return {
+    line: result,
+    progress: clamp((scrollTop - lineTop) / Math.max(1, lineBottom - lineTop), 0, 1)
+  };
 }
 
 function getEditorLineHeight() {
   return parseFloat(getComputedStyle(elements.editor).lineHeight) || 24;
+}
+
+function getEditorLineTop(lineIndex) {
+  const metrics = getEditorLineMetrics();
+  const safeIndex = Math.min(Math.max(0, lineIndex), metrics.tops.length - 1);
+  return metrics.tops[safeIndex] || 0;
+}
+
+function getEditorLineMetrics() {
+  const editor = elements.editor;
+  const styles = getComputedStyle(editor);
+  const cacheKey = [
+    editor.value,
+    editor.clientWidth,
+    styles.font,
+    styles.lineHeight,
+    styles.padding,
+    styles.tabSize,
+    styles.whiteSpace,
+    styles.overflowWrap,
+    styles.wordBreak
+  ].join("\u0001");
+
+  if (editorLineMetricsCache?.key === cacheKey) return editorLineMetricsCache;
+
+  const mirror = document.createElement("div");
+  mirror.style.position = "fixed";
+  mirror.style.left = "-10000px";
+  mirror.style.top = "0";
+  mirror.style.visibility = "hidden";
+  mirror.style.pointerEvents = "none";
+  mirror.style.boxSizing = "border-box";
+  mirror.style.width = `${editor.clientWidth}px`;
+  mirror.style.padding = styles.padding;
+  mirror.style.border = styles.border;
+  mirror.style.font = styles.font;
+  mirror.style.lineHeight = styles.lineHeight;
+  mirror.style.letterSpacing = styles.letterSpacing;
+  mirror.style.tabSize = styles.tabSize;
+  mirror.style.whiteSpace = "pre-wrap";
+  mirror.style.overflowWrap = styles.overflowWrap === "normal" ? "break-word" : styles.overflowWrap;
+  mirror.style.wordBreak = styles.wordBreak;
+
+  const lines = editor.value.split(/\r?\n/);
+  const lineHeight = getEditorLineHeight();
+  const lineElements = lines.map((line) => {
+    const element = document.createElement("div");
+    element.textContent = line || "\u200B";
+    element.style.minHeight = `${lineHeight}px`;
+    mirror.appendChild(element);
+    return element;
+  });
+
+  document.body.appendChild(mirror);
+  const mirrorTop = mirror.getBoundingClientRect().top;
+  const tops = lineElements.map((element) => element.getBoundingClientRect().top - mirrorTop);
+  const bottoms = lineElements.map((element) => element.getBoundingClientRect().bottom - mirrorTop);
+  mirror.remove();
+
+  editorLineMetricsCache = { key: cacheKey, tops, bottoms };
+  return editorLineMetricsCache;
+}
+
+function invalidateEditorLineMetrics() {
+  editorLineMetricsCache = null;
 }
 
 function startResize(event) {
